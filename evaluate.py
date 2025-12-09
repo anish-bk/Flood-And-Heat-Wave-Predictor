@@ -8,6 +8,7 @@ import os
 import pandas as pd
 import numpy as np
 import joblib
+import xgboost as xgb
 from utils import read_parquet, ensure_dir
 from sklearn.metrics import average_precision_score, roc_auc_score, precision_recall_curve, roc_curve
 import matplotlib.pyplot as plt
@@ -47,12 +48,14 @@ def main(args):
     df = read_parquet(args.features)
     model = joblib.load(args.model)
     X, y, df_used = prepare_Xy(df, target=args.target)
-    # if it's xgboost booster object
-    if hasattr(model, 'predict'):
-        preds = model.predict(X)
-    else:
-        # fallback
+    # if it's xgboost Booster object, convert to DMatrix
+    if isinstance(model, xgb.Booster):
+        dmatrix = xgb.DMatrix(X)
+        preds = model.predict(dmatrix)
+    elif hasattr(model, 'predict_proba'):
         preds = model.predict_proba(X)[:,1]
+    else:
+        preds = model.predict(X)
     pr, roc = plot_pr_roc(y, preds, args.out_dir, prefix=args.target+'_')
     print(f'PR AUC: {pr:.4f}, ROC AUC: {roc:.4f}')
     # Save a small results csv with dates and preds
