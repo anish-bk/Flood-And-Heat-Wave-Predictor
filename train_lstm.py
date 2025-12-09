@@ -23,7 +23,6 @@ class LSTMModel(nn.Module):
         self.fc1 = nn.Linear(hidden_size, fc_size)
         self.relu = nn.ReLU()
         self.fc2 = nn.Linear(fc_size, 1)
-        self.sigmoid = nn.Sigmoid()
     
     def forward(self, x):
         # x shape: (batch, timesteps, features)
@@ -32,8 +31,7 @@ class LSTMModel(nn.Module):
         out = self.fc1(h_n[-1])
         out = self.relu(out)
         out = self.fc2(out)
-        out = self.sigmoid(out)
-        return out.squeeze(-1)
+        return out.squeeze(-1)  # Returns logits, apply sigmoid for probabilities
 
 def build_sequences(df, timesteps=14, target='heatwave'):
     df = df.sort_values(['District','Date']).copy()
@@ -49,8 +47,10 @@ def build_sequences(df, timesteps=14, target='heatwave'):
             seq = arr[i-timesteps:i]
             sequences.append(seq)
             targets.append(lab[i])
-    X = np.array(sequences)
-    y = np.array(targets)
+    X = np.array(sequences, dtype=np.float32)
+    y = np.array(targets, dtype=np.float32)
+    # Replace NaN and inf values
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
     return X, y, feature_cols
 
 
@@ -81,7 +81,9 @@ def evaluate(model, dataloader, criterion, device):
             outputs = model(X_batch)
             loss = criterion(outputs, y_batch)
             total_loss += loss.item() * X_batch.size(0)
-            all_preds.extend(outputs.cpu().numpy())
+            # Apply sigmoid to get probabilities for AUC calculation
+            probs = torch.sigmoid(outputs)
+            all_preds.extend(probs.cpu().numpy())
             all_targets.extend(y_batch.cpu().numpy())
     avg_loss = total_loss / len(dataloader.dataset)
     auc = roc_auc_score(all_targets, all_preds) if len(set(all_targets)) > 1 else 0.0
@@ -116,8 +118,9 @@ def main(args):
 
     # Setup device, model, loss, optimizer
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f'Using device: {device}')
     model = LSTMModel(input_size=nf, hidden_size=64, fc_size=32).to(device)
-    criterion = nn.BCELoss()
+    criterion = nn.BCEWithLogitsLoss()  # More numerically stable than BCELoss
     optimizer = torch.optim.Adam(model.parameters())
 
     # Training loop
