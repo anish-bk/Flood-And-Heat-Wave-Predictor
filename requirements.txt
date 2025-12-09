@@ -9,3 +9,4 @@ shap
 joblib
 fastparquet
 pyarrow
+gradio
