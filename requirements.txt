@@ -10,3 +10,10 @@ joblib
 fastparquet
 pyarrow
 gradio
+pyspark
+cassandra-driver
+colorama
+kafka-python
+fastapi
+uvicorn
+requests

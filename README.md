@@ -2,79 +2,149 @@
 
 This repo provides a complete pipeline (separate Python scripts) to: ingest data, label heatwave and flood proxy targets, engineer features, train XGBoost baseline, optionally train an LSTM sequence model, evaluate and produce reports.
 
-## How to Run
+# Heatwave & Flood Prediction Pipeline
 
-### 1. Create virtualenv and install requirements
+A complete pipeline and demo for real-time weather monitoring and disaster risk prediction. The system demonstrates:
+- Data ingestion & feature engineering
+- XGBoost and optional LSTM training
+- Real-time streaming (OpenWeatherMap → Kafka → ML → Cassandra)
+- Gradio dashboard with Live and Historical (Cassandra) views
 
-**Linux/macOS:**
-```bash
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
+This repository is intended as a demonstration of a Big Data streaming + ML pipeline for monitoring districts in Nepal's Terai region.
 
-**Windows (PowerShell):**
+---
+
+## Quick Start (Windows PowerShell)
+
+1. Create and activate a virtual environment, then install dependencies:
+
 ```powershell
 python -m venv venv
 .\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-### 2. Prepare input data
+2. Set your OpenWeatherMap API key (required for streaming):
 
-Place your input CSV at `data/weather.csv` with the required weather columns.
-
-### 3. Run pipeline steps
-
-```bash
-# Step 1: Data Ingestion - converts raw CSV to parquet format
-python data_ingest.py --input data/weather.csv --out_dir data/processed
-
-# Step 2: Labeling - creates heatwave and flood proxy labels
-python labeling.py --in_dir data/processed --out_dir data/processed
-
-# Step 3: Feature Engineering - generates features for model training
-python features.py --in_dir data/processed --out_dir data/processed
-
-# Step 4: Train XGBoost Model
-python train_xgb.py --features data/processed/features.parquet --out_dir models/
-
-# Step 5: Evaluate Model - generates metrics and plots
-python evaluate.py --features data/processed/features.parquet --model models/xgb_heatwave_model.joblib --out_dir results/
+```powershell
+setx OPENWEATHERMAP_API_KEY "your_api_key_here"
+# Restart PowerShell to load environment variable into current session
 ```
 
-### 4. Optional: Train LSTM Model (PyTorch)
+3. Start infrastructure (Docker Compose includes Kafka, Zookeeper, Cassandra, Kafka-UI):
 
-Requires sufficient sequential data:
-```bash
-python train_lstm.py --features data/processed/features.parquet --out_dir models/
+```powershell
+docker-compose up -d
 ```
 
-You can also specify the target and timesteps:
-```bash
-python train_lstm.py --features data/processed/features.parquet --out_dir models/ --target heatwave --timesteps 14
-python train_lstm.py --features data/processed/features.parquet --out_dir models/ --target flood_proxy --timesteps 14
+4. Start continuous background streaming (collects OpenWeatherMap for all districts and writes to Cassandra):
+
+```powershell
+python background_streamer.py --interval 30
 ```
 
-## Project Structure
+5. (Optional) Start the producer API (manual fetch/publish endpoints):
 
+```powershell
+python kafka_producer_api.py
 ```
-├── data_ingest.py      # Data ingestion script
-├── labeling.py         # Heatwave and flood labeling
-├── features.py         # Feature engineering
-├── train_xgb.py        # XGBoost model training
-├── train_lstm.py       # LSTM model training (PyTorch)
-├── evaluate.py         # Model evaluation and plotting
-├── utils.py            # Utility functions
-├── requirements.txt    # Python dependencies
-└── README.md           # This file
+
+6. Start the Gradio dashboard (Live + Historical tabs):
+
+```powershell
+python weather_dashboard.py
+# Open http://localhost:7860
 ```
+
+7. Query Cassandra directly with the provided CLI tool:
+
+```powershell
+# Show stats
+python cassandra_query.py stats
+
+# Query observations for a district
+python cassandra_query.py observations --district Bara --limit 20
+
+# Export to CSV
+python cassandra_query.py export --district Bara --output bara_weather.csv
+```
+
+---
+
+## Files of Interest
+
+- `background_streamer.py` — Background streamer that fetches OpenWeatherMap for all monitored districts in parallel and stores observations + predictions in Cassandra. Use this for continuous ingestion.
+- `kafka_producer_api.py` — FastAPI producer that can fetch weather for a city and publish to Kafka (also used by the dashboard for single fetches).
+- `weather_dashboard.py` — Gradio dashboard with two main tabs:
+	- Live Streaming: real-time fetch + ML predictions
+	- Historical Data (Cassandra): query observations & predictions stored in Cassandra
+- `cassandra_query.py` — CLI tool for ad-hoc queries, stats, and export from Cassandra.
+- `train_xgb.py`, `train_lstm.py`, `evaluate.py` — model training and evaluation scripts.
+
+---
+
+## Cassandra: notes & schema
+
+The dashboard and background streamer create and use the keyspace `weather_monitoring` with tables:
+- `weather_observations` — raw time-series observations (partitioned by district, clustered by fetch_time)
+- `weather_predictions` — stored predictions per district
+- `daily_weather_summary` — aggregate daily stats
+
+If you ever lose the keyspace, re-run the dashboard or the background streamer to re-create schema.
+
+---
+
+## Running locally (summary)
+
+1. Start Docker services:
+```powershell
+docker-compose up -d
+```
+2. Start background ingestion:
+```powershell
+python background_streamer.py --interval 30
+```
+3. Start dashboard:
+```powershell
+python weather_dashboard.py
+```
+4. Run ad-hoc queries:
+```powershell
+python cassandra_query.py observations --district Bara --limit 10
+```
+
+---
 
 ## Requirements
 
-- Python 3.8+
-- pandas, numpy, scikit-learn
-- xgboost
-- torch (PyTorch)
-- matplotlib, seaborn
-- shap
+Key Python packages are listed in `requirements.txt`. Important ones used by the added components:
+- `gradio` — Web dashboard UI
+- `cassandra-driver` — Cassandra client
+- `kafka-python` — Kafka client (producer/consumer)
+- `requests` — HTTP requests to OpenWeatherMap and producer API
+- `xgboost`, `joblib` — ML models
+- `pandas`, `numpy` — Data handling
+
+Install all with:
+
+```powershell
+pip install -r requirements.txt
+```
+
+---
+
+## Notes & Troubleshooting
+
+- If the dashboard reports Cassandra not connected, ensure Docker Compose is running and the Cassandra container is healthy.
+- If you see `NoBrokersAvailable` from Kafka, ensure Kafka & Zookeeper are up (`docker-compose ps`) and retry the producer/consumer.
+- Background streamer requires a valid `OPENWEATHERMAP_API_KEY` environment variable.
+
+If you'd like, I can also:
+- Push a small example of how to visualize historical trends (plots) in the dashboard
+- Add Docker Compose health-check automation to ensure Cassandra/Kafka restart on failures
+
+---
+
+## License
+
+This project is provided for demonstration and research purposes.
