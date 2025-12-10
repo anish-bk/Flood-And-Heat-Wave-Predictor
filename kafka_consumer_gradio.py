@@ -64,10 +64,260 @@ KAFKA_CONFIG = {
     'auto_offset_reset': 'latest'
 }
 
+CASSANDRA_CONFIG = {
+    'hosts': ['127.0.0.1'],
+    'port': 9042,
+    'keyspace': 'weather_stream'
+}
+
 MODEL_PATHS = {
     'heatwave': 'models/xgb_heatwave_model.joblib',
     'flood': 'models/xgb_flood_proxy_model.joblib'
 }
+
+
+# ============================================================================
+# CASSANDRA STORAGE
+# ============================================================================
+
+class CassandraStorage:
+    """Cassandra storage for streaming weather data and predictions."""
+    
+    def __init__(self, hosts: list, port: int, keyspace: str):
+        self.hosts = hosts
+        self.port = port
+        self.keyspace = keyspace
+        self.cluster = None
+        self.session = None
+        self.connected = False
+        self.prepared_statements = {}
+        self.stats = {
+            'records_stored': 0,
+            'predictions_stored': 0,
+            'errors': 0
+        }
+    
+    def connect(self) -> bool:
+        """Connect to Cassandra cluster."""
+        if not CASSANDRA_AVAILABLE:
+            print("⚠️  Cassandra driver not available")
+            return False
+        
+        try:
+            self.cluster = Cluster(contact_points=self.hosts, port=self.port)
+            self.session = self.cluster.connect()
+            self.connected = True
+            print(f"✅ Connected to Cassandra at {self.hosts}:{self.port}")
+            self._setup_schema()
+            self._prepare_statements()
+            return True
+        except Exception as e:
+            print(f"⚠️  Cassandra connection failed: {e}")
+            self.connected = False
+            return False
+    
+    def _setup_schema(self):
+        """Create keyspace and tables if they don't exist."""
+        # Create keyspace
+        self.session.execute(f"""
+            CREATE KEYSPACE IF NOT EXISTS {self.keyspace}
+            WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': 1}}
+        """)
+        
+        self.session.set_keyspace(self.keyspace)
+        
+        # Table for raw streaming data
+        self.session.execute("""
+            CREATE TABLE IF NOT EXISTS streaming_weather (
+                id UUID,
+                district TEXT,
+                date TEXT,
+                ingestion_time TIMESTAMP,
+                latitude DOUBLE,
+                longitude DOUBLE,
+                max_temp DOUBLE,
+                min_temp DOUBLE,
+                temp_range DOUBLE,
+                precipitation DOUBLE,
+                humidity DOUBLE,
+                wind_speed_10m DOUBLE,
+                wind_speed_50m DOUBLE,
+                kafka_partition INT,
+                kafka_offset BIGINT,
+                PRIMARY KEY ((district), ingestion_time, id)
+            ) WITH CLUSTERING ORDER BY (ingestion_time DESC)
+        """)
+        
+        # Table for predictions
+        self.session.execute("""
+            CREATE TABLE IF NOT EXISTS streaming_predictions (
+                id UUID,
+                district TEXT,
+                prediction_time TIMESTAMP,
+                max_temp DOUBLE,
+                precipitation DOUBLE,
+                humidity DOUBLE,
+                heatwave_probability DOUBLE,
+                flood_probability DOUBLE,
+                heatwave_risk TEXT,
+                flood_risk TEXT,
+                PRIMARY KEY ((district), prediction_time, id)
+            ) WITH CLUSTERING ORDER BY (prediction_time DESC)
+        """)
+        
+        # Table for aggregated stats (per district per hour)
+        self.session.execute("""
+            CREATE TABLE IF NOT EXISTS hourly_stats (
+                district TEXT,
+                hour_bucket TIMESTAMP,
+                record_count INT,
+                avg_temp DOUBLE,
+                max_temp DOUBLE,
+                total_precip DOUBLE,
+                heatwave_alerts INT,
+                flood_alerts INT,
+                PRIMARY KEY ((district), hour_bucket)
+            ) WITH CLUSTERING ORDER BY (hour_bucket DESC)
+        """)
+        
+        print("✅ Cassandra schema ready")
+    
+    def _prepare_statements(self):
+        """Prepare CQL statements for better performance."""
+        self.prepared_statements['insert_weather'] = self.session.prepare("""
+            INSERT INTO streaming_weather 
+            (id, district, date, ingestion_time, latitude, longitude, max_temp, min_temp, 
+             temp_range, precipitation, humidity, wind_speed_10m, wind_speed_50m,
+             kafka_partition, kafka_offset)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """)
+        
+        self.prepared_statements['insert_prediction'] = self.session.prepare("""
+            INSERT INTO streaming_predictions
+            (id, district, prediction_time, max_temp, precipitation, humidity,
+             heatwave_probability, flood_probability, heatwave_risk, flood_risk)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """)
+        
+        print("✅ Cassandra prepared statements ready")
+    
+    def store_weather_data(self, data: dict) -> bool:
+        """Store raw weather data from Kafka."""
+        if not self.connected:
+            return False
+        
+        try:
+            self.session.execute(
+                self.prepared_statements['insert_weather'],
+                (
+                    uuid.uuid4(),
+                    data.get('District', 'Unknown'),
+                    data.get('Date', ''),
+                    datetime.now(),
+                    float(data.get('Latitude', 0)),
+                    float(data.get('Longitude', 0)),
+                    float(data.get('MaxTemp_2m', 0)),
+                    float(data.get('MinTemp_2m', 0)),
+                    float(data.get('TempRange_2m', 0)),
+                    float(data.get('Precip', 0)),
+                    float(data.get('RH_2m', 0)),
+                    float(data.get('WindSpeed_10m', 0)),
+                    float(data.get('WindSpeed_50m', 0)),
+                    int(data.get('kafka_partition', 0)),
+                    int(data.get('kafka_offset', 0))
+                )
+            )
+            self.stats['records_stored'] += 1
+            return True
+        except Exception as e:
+            print(f"❌ Error storing weather data: {e}")
+            self.stats['errors'] += 1
+            return False
+    
+    def store_prediction(self, data: dict, prediction: dict) -> bool:
+        """Store prediction results."""
+        if not self.connected:
+            return False
+        
+        try:
+            self.session.execute(
+                self.prepared_statements['insert_prediction'],
+                (
+                    uuid.uuid4(),
+                    data.get('District', 'Unknown'),
+                    datetime.now(),
+                    float(data.get('MaxTemp_2m', 0)),
+                    float(data.get('Precip', 0)),
+                    float(data.get('RH_2m', 0)),
+                    float(prediction.get('heatwave_probability', 0)),
+                    float(prediction.get('flood_probability', 0)),
+                    prediction.get('heatwave_risk', 'LOW'),
+                    prediction.get('flood_risk', 'LOW')
+                )
+            )
+            self.stats['predictions_stored'] += 1
+            return True
+        except Exception as e:
+            print(f"❌ Error storing prediction: {e}")
+            self.stats['errors'] += 1
+            return False
+    
+    def get_recent_data(self, district: str = None, limit: int = 20) -> list:
+        """Query recent streaming data."""
+        if not self.connected:
+            return []
+        
+        try:
+            if district:
+                rows = self.session.execute(f"""
+                    SELECT * FROM streaming_weather 
+                    WHERE district = '{district}'
+                    LIMIT {limit}
+                """)
+            else:
+                # Get from all districts (limited query)
+                rows = self.session.execute(f"""
+                    SELECT * FROM streaming_weather 
+                    LIMIT {limit}
+                    ALLOW FILTERING
+                """)
+            return list(rows)
+        except Exception as e:
+            print(f"❌ Query error: {e}")
+            return []
+    
+    def get_recent_predictions(self, district: str = None, limit: int = 20) -> list:
+        """Query recent predictions."""
+        if not self.connected:
+            return []
+        
+        try:
+            if district:
+                rows = self.session.execute(f"""
+                    SELECT * FROM streaming_predictions 
+                    WHERE district = '{district}'
+                    LIMIT {limit}
+                """)
+            else:
+                rows = self.session.execute(f"""
+                    SELECT * FROM streaming_predictions 
+                    LIMIT {limit}
+                    ALLOW FILTERING
+                """)
+            return list(rows)
+        except Exception as e:
+            print(f"❌ Query error: {e}")
+            return []
+    
+    def get_stats(self) -> dict:
+        """Get storage statistics."""
+        return self.stats.copy()
+    
+    def close(self):
+        """Close Cassandra connection."""
+        if self.cluster:
+            self.cluster.shutdown()
+            self.connected = False
 
 
 # ============================================================================
@@ -180,9 +430,9 @@ class PredictionEngine:
 # ============================================================================
 
 class WeatherKafkaConsumer:
-    """Kafka consumer that subscribes to weather data topic."""
+    """Kafka consumer that subscribes to weather data topic and stores in Cassandra."""
     
-    def __init__(self, bootstrap_servers: list, topic: str, group_id: str):
+    def __init__(self, bootstrap_servers: list, topic: str, group_id: str, cassandra_storage=None):
         self.bootstrap_servers = bootstrap_servers
         self.topic = topic
         self.group_id = group_id
@@ -192,11 +442,14 @@ class WeatherKafkaConsumer:
         self.recent_messages = deque(maxlen=100)
         self.stats = {
             'messages_received': 0,
+            'messages_stored': 0,
+            'predictions_stored': 0,
             'errors': 0,
             'last_message_time': None
         }
         self.consumer_thread = None
         self.prediction_engine = PredictionEngine()
+        self.cassandra = cassandra_storage  # Cassandra storage instance
     
     def connect(self) -> bool:
         """Connect to Kafka broker."""
@@ -240,16 +493,23 @@ class WeatherKafkaConsumer:
                         break
                     
                     data = message.value
+                    data['kafka_partition'] = message.partition
+                    data['kafka_offset'] = message.offset
                     
                     # Make prediction
                     prediction = self.prediction_engine.predict(data)
+                    
+                    # Store in Cassandra
+                    if self.cassandra and self.cassandra.connected:
+                        if self.cassandra.store_weather_data(data):
+                            self.stats['messages_stored'] += 1
+                        if self.cassandra.store_prediction(data, prediction):
+                            self.stats['predictions_stored'] += 1
                     
                     # Combine data with prediction
                     enriched = {
                         **data,
                         **prediction,
-                        'kafka_partition': message.partition,
-                        'kafka_offset': message.offset,
                         'consumed_at': datetime.now().isoformat()
                     }
                     
@@ -291,15 +551,23 @@ class WeatherKafkaConsumer:
 # GRADIO DASHBOARD
 # ============================================================================
 
-# Global consumer instance
+# Global Cassandra storage instance
+cassandra_storage = CassandraStorage(
+    hosts=CASSANDRA_CONFIG['hosts'],
+    port=CASSANDRA_CONFIG['port'],
+    keyspace=CASSANDRA_CONFIG['keyspace']
+)
+
+# Global consumer instance with Cassandra
 consumer = WeatherKafkaConsumer(
     bootstrap_servers=KAFKA_CONFIG['bootstrap_servers'],
     topic=KAFKA_CONFIG['topic'],
-    group_id=KAFKA_CONFIG['group_id']
+    group_id=KAFKA_CONFIG['group_id'],
+    cassandra_storage=cassandra_storage
 )
 
 
-def create_stats_html(stats: dict, latest: dict = None) -> str:
+def create_stats_html(stats: dict, latest: dict = None, cassandra_stats: dict = None) -> str:
     """Create statistics display HTML."""
     heatwave_prob = latest.get('heatwave_probability', 0) * 100 if latest else 0
     flood_prob = latest.get('flood_probability', 0) * 100 if latest else 0
@@ -307,27 +575,34 @@ def create_stats_html(stats: dict, latest: dict = None) -> str:
     heatwave_color = "#ef4444" if heatwave_prob > 50 else "#f59e0b" if heatwave_prob > 30 else "#22c55e"
     flood_color = "#3b82f6" if flood_prob > 50 else "#06b6d4" if flood_prob > 30 else "#22c55e"
     
+    cassandra_stored = cassandra_stats.get('records_stored', 0) if cassandra_stats else 0
+    
     return f"""
-    <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; padding: 15px;">
-        <div style="background: linear-gradient(135deg, #1e40af, #3b82f6); padding: 20px; 
+    <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; padding: 15px;">
+        <div style="background: linear-gradient(135deg, #1e40af, #3b82f6); padding: 18px; 
                     border-radius: 16px; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.3);">
-            <div style="font-size: 14px; color: #93c5fd;">📨 Messages Received</div>
-            <div style="font-size: 32px; font-weight: bold; color: white;">{stats.get('messages_received', 0):,}</div>
+            <div style="font-size: 13px; color: #93c5fd;">📨 Kafka Messages</div>
+            <div style="font-size: 28px; font-weight: bold; color: white;">{stats.get('messages_received', 0):,}</div>
         </div>
-        <div style="background: linear-gradient(135deg, #7c2d12, {heatwave_color}); padding: 20px; 
+        <div style="background: linear-gradient(135deg, #7c2d12, {heatwave_color}); padding: 18px; 
                     border-radius: 16px; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.3);">
-            <div style="font-size: 14px; color: #fecaca;">🔥 Heatwave Risk</div>
-            <div style="font-size: 32px; font-weight: bold; color: white;">{heatwave_prob:.1f}%</div>
+            <div style="font-size: 13px; color: #fecaca;">🔥 Heatwave Risk</div>
+            <div style="font-size: 28px; font-weight: bold; color: white;">{heatwave_prob:.1f}%</div>
         </div>
-        <div style="background: linear-gradient(135deg, #1e3a5f, {flood_color}); padding: 20px; 
+        <div style="background: linear-gradient(135deg, #1e3a5f, {flood_color}); padding: 18px; 
                     border-radius: 16px; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.3);">
-            <div style="font-size: 14px; color: #bfdbfe;">🌊 Flood Risk</div>
-            <div style="font-size: 32px; font-weight: bold; color: white;">{flood_prob:.1f}%</div>
+            <div style="font-size: 13px; color: #bfdbfe;">🌊 Flood Risk</div>
+            <div style="font-size: 28px; font-weight: bold; color: white;">{flood_prob:.1f}%</div>
         </div>
-        <div style="background: linear-gradient(135deg, #14532d, #22c55e); padding: 20px; 
+        <div style="background: linear-gradient(135deg, #581c87, #9333ea); padding: 18px; 
                     border-radius: 16px; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.3);">
-            <div style="font-size: 14px; color: #bbf7d0;">📍 Latest District</div>
-            <div style="font-size: 24px; font-weight: bold; color: white;">{latest.get('District', 'N/A') if latest else 'Waiting...'}</div>
+            <div style="font-size: 13px; color: #e9d5ff;">🗄️ Cassandra Stored</div>
+            <div style="font-size: 28px; font-weight: bold; color: white;">{cassandra_stored:,}</div>
+        </div>
+        <div style="background: linear-gradient(135deg, #14532d, #22c55e); padding: 18px; 
+                    border-radius: 16px; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.3);">
+            <div style="font-size: 13px; color: #bbf7d0;">📍 Latest District</div>
+            <div style="font-size: 22px; font-weight: bold; color: white;">{latest.get('District', 'N/A') if latest else 'Waiting...'}</div>
         </div>
     </div>
     """
@@ -401,8 +676,14 @@ def refresh_dashboard():
     messages = consumer.get_recent_messages(20)
     latest = messages[-1] if messages else None
     
+    # Cassandra stats
+    cassandra_stats = {
+        'records_stored': stats.get('messages_stored', 0),
+        'predictions_stored': stats.get('predictions_stored', 0)
+    }
+    
     return (
-        create_stats_html(stats, latest),
+        create_stats_html(stats, latest, cassandra_stats),
         create_latest_data_html(latest),
         create_message_table(messages)
     )
@@ -478,7 +759,7 @@ def create_dashboard():
         
         # Statistics
         gr.HTML('<div class="section-header">📊 Real-Time Statistics & Predictions</div>')
-        stats_html = gr.HTML(value=create_stats_html({}, None))
+        stats_html = gr.HTML(value=create_stats_html({}, None, None))
         
         # Latest Data
         gr.HTML('<div class="section-header">📡 Latest Weather Data</div>')
@@ -498,7 +779,7 @@ def create_dashboard():
         # Info
         with gr.Accordion("ℹ️ Architecture & Usage", open=False):
             gr.Markdown("""
-            ## Kafka Streaming Architecture
+            ## Kafka + Cassandra Streaming Architecture
             
             ```
             ┌──────────────┐     ┌─────────────┐     ┌──────────────┐     ┌─────────────┐
@@ -510,12 +791,25 @@ def create_dashboard():
               HTTP POST                                                    ML Prediction
               /weather                                                          │
                                                                                 ▼
-                                                                        Real-Time Display
+                                                                  ┌─────────────────────────┐
+                                                                  │   Apache Cassandra      │
+                                                                  │   - streaming_weather   │
+                                                                  │   - streaming_predictions│
+                                                                  │   - hourly_stats        │
+                                                                  └─────────────────────────┘
             ```
+            
+            ## Data Flow
+            
+            1. **API** receives weather data via REST
+            2. **Kafka** handles message streaming
+            3. **Consumer** makes ML predictions (XGBoost + LSTM)
+            4. **Cassandra** stores raw data + predictions for time-series analysis
+            5. **Dashboard** displays real-time statistics
             
             ## How to Use
             
-            1. **Start Kafka**: `docker-compose up -d`
+            1. **Start services**: `docker-compose up -d` (Kafka + Cassandra)
             2. **Start Producer API**: `python kafka_producer_api.py`
             3. **Start this Dashboard**: `python kafka_consumer_gradio.py`
             4. **Send data**: POST to `http://localhost:8000/weather`
@@ -527,6 +821,12 @@ def create_dashboard():
               -H "Content-Type: application/json" \\
               -d '{"district": "Chitawan", "date": "2024-06-15", "max_temp": 42.5, "precipitation": 15.0, "humidity": 75.0}'
             ```
+            
+            ## Cassandra Tables
+            
+            - **streaming_weather**: Raw weather observations (partition by district, cluster by time)
+            - **streaming_predictions**: ML predictions (partition by prediction_type, cluster by time)
+            - **hourly_stats**: Aggregated hourly statistics
             """)
         
         # Event handlers
@@ -548,25 +848,34 @@ def main():
 ║                                                                              ║
 ║   🌡️  KAFKA WEATHER CONSUMER - GRADIO DASHBOARD                              ║
 ║                                                                              ║
-║   Subscribes to Kafka and displays real-time weather predictions             ║
+║   Subscribes to Kafka and stores data in Cassandra with real-time predictions║
 ║                                                                              ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
 📡 Kafka Configuration:
    Topic: {topic}
-   Servers: {servers}
+   Servers: {kafka_servers}
    Group ID: {group}
+
+🗄️ Cassandra Configuration:
+   Hosts: {cassandra_hosts}
+   Port: {cassandra_port}
+   Keyspace: {keyspace}
+   Tables: streaming_weather, streaming_predictions, hourly_stats
 
 🔗 Dashboard: http://localhost:7860
 
 💡 Prerequisites:
-   1. Start Kafka: docker-compose up -d
+   1. Start Kafka + Cassandra: docker-compose up -d
    2. Start Producer API: python kafka_producer_api.py
    3. Send data to API: POST http://localhost:8000/weather
 """.format(
         topic=KAFKA_CONFIG['topic'],
-        servers=KAFKA_CONFIG['bootstrap_servers'],
-        group=KAFKA_CONFIG['group_id']
+        kafka_servers=KAFKA_CONFIG['bootstrap_servers'],
+        group=KAFKA_CONFIG['group_id'],
+        cassandra_hosts=CASSANDRA_CONFIG['hosts'],
+        cassandra_port=CASSANDRA_CONFIG['port'],
+        keyspace=CASSANDRA_CONFIG['keyspace']
     ))
     
     app = create_dashboard()
