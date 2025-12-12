@@ -863,7 +863,7 @@ def main():
    Keyspace: {keyspace}
    Tables: streaming_weather, streaming_predictions, hourly_stats
 
-🔗 Dashboard: http://localhost:7860
+🔗 Dashboard: http://localhost:7861
 
 💡 Prerequisites:
    1. Start Kafka + Cassandra: docker-compose up -d
@@ -881,7 +881,7 @@ def main():
     app = create_dashboard()
     app.launch(
         server_name="127.0.0.1",
-        server_port=7860,
+        server_port=7861,
         share=False
     )
 

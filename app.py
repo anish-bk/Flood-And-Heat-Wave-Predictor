@@ -433,7 +433,7 @@ if __name__ == "__main__":
     app.launch(
         share=True,
         server_name="localhost",
-        server_port=7860,
+        server_port=7862,
         show_api=True,
         show_error=True
     )
